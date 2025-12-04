@@ -68,7 +68,7 @@
     <!-- Loading Screen -->
     <div id="loading-overlay">
         <i class="fa-solid fa-cloud text-orange-400 text-5xl animate-bounce mb-4"></i>
-        <p class="text-gray-500 font-bold">正在讀取雲端行程...</p>
+        <p id="loading-text" class="text-gray-500 font-bold">正在讀取行程...</p>
     </div>
 
     <div class="max-w-md mx-auto shadow-2xl min-h-screen bg-orange-50 relative overflow-hidden">
@@ -121,7 +121,6 @@
                             <span class="hidden sm:inline">Gemini</span>
                         </button>
 
-                        <!-- 新增：搜尋 MapCode 網站按鈕 -->
                         <button onclick="window.openMapCodeSite()" class="flex items-center space-x-1 bg-blue-50 hover:bg-blue-100 px-3 py-1.5 rounded-lg text-xs font-bold text-blue-600 transition-colors border border-blue-100">
                             <i class="fa-solid fa-globe"></i>
                             <span>搜尋</span>
@@ -228,16 +227,30 @@
         import { getFirestore, doc, onSnapshot, setDoc, collection } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
         import { getAuth, signInAnonymously, signInWithCustomToken } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
 
-        // 1. Firebase 初始化
-        const firebaseConfig = JSON.parse(__firebase_config);
-        const app = initializeApp(firebaseConfig);
-        const db = getFirestore(app);
-        const auth = getAuth(app);
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app';
+        // 1. Firebase 初始化 (包含自動降級 LocalStorage 邏輯)
+        let db, auth, docRef;
+        let useLocalStorage = false;
+
+        try {
+            // 檢查是否在 Firebase 環境中 (GitHub Pages 部署時 __firebase_config 會不存在)
+            if (typeof __firebase_config !== 'undefined') {
+                const firebaseConfig = JSON.parse(__firebase_config);
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app';
+                docRef = doc(db, 'artifacts', appId, 'public', 'data', 'itinerary', 'main_plan');
+            } else {
+                throw new Error("No Firebase Config found");
+            }
+        } catch (e) {
+            console.warn("Running in Local Mode (Offline/GitHub Pages):", e.message);
+            useLocalStorage = true;
+        }
 
         // 2. 應用程式狀態 (State)
         let state = {
-            itinerary: [], // 將從 Firebase 讀取
+            itinerary: [], 
             activeId: 'd1-1',
             showMapCode: false,
             addModalTargetIndex: 0
@@ -305,48 +318,78 @@
             'Map': 'fa-map'
         };
 
-        // 4. Firestore 資料儲存邏輯
-        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'itinerary', 'main_plan');
-
+        // 4. 啟動應用程式 (initApp)
         async function initApp() {
-            try {
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    await signInWithCustomToken(auth, __initial_auth_token);
-                } else {
-                    await signInAnonymously(auth);
-                }
-
-                onSnapshot(docRef, (docSnapshot) => {
-                    document.getElementById('loading-overlay').style.display = 'none';
-                    
-                    if (docSnapshot.exists()) {
-                        state.itinerary = docSnapshot.data().data;
-                    } else {
+            if (useLocalStorage) {
+                // === LocalStorage 模式 (GitHub Pages) ===
+                document.getElementById('loading-text').innerText = "讀取本地行程...";
+                
+                // 嘗試讀取本地資料
+                const savedData = localStorage.getItem('fuji_trip_data');
+                if (savedData) {
+                    try {
+                        state.itinerary = JSON.parse(savedData);
+                    } catch(e) {
+                        console.error("Parse Error:", e);
                         state.itinerary = initialDefaultItinerary;
-                        saveData(); 
                     }
-                    renderItinerary();
-                    updateBottomBar();
-                }, (error) => {
-                    console.error("Sync Error:", error);
-                    document.getElementById('loading-overlay').style.display = 'none';
-                });
+                } else {
+                    state.itinerary = initialDefaultItinerary;
+                }
+                
+                finishLoading();
+            } else {
+                // === Firebase 模式 (預覽環境) ===
+                try {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
 
-            } catch (err) {
-                console.error("Auth Error:", err);
-                state.itinerary = initialDefaultItinerary;
-                renderItinerary();
-                updateBottomBar();
-                document.getElementById('loading-overlay').style.display = 'none';
+                    onSnapshot(docRef, (docSnapshot) => {
+                        if (docSnapshot.exists()) {
+                            state.itinerary = docSnapshot.data().data;
+                        } else {
+                            state.itinerary = initialDefaultItinerary;
+                            saveData(); 
+                        }
+                        finishLoading();
+                    }, (error) => {
+                        console.error("Sync Error:", error);
+                        // 出錯時降級為本地資料
+                        state.itinerary = initialDefaultItinerary;
+                        finishLoading();
+                    });
+
+                } catch (err) {
+                    console.error("Auth Error:", err);
+                    state.itinerary = initialDefaultItinerary;
+                    finishLoading();
+                }
             }
             renderWeather();
         }
 
+        // 完成讀取後的動作
+        function finishLoading() {
+            renderItinerary();
+            updateBottomBar();
+            document.getElementById('loading-overlay').style.display = 'none';
+        }
+
+        // 儲存資料 (自動判斷模式)
         async function saveData() {
-            try {
-                await setDoc(docRef, { data: state.itinerary });
-            } catch (e) {
-                console.error("Save Error:", e);
+            if (useLocalStorage) {
+                // 儲存到 LocalStorage
+                localStorage.setItem('fuji_trip_data', JSON.stringify(state.itinerary));
+            } else {
+                // 儲存到 Firebase
+                try {
+                    await setDoc(docRef, { data: state.itinerary });
+                } catch (e) {
+                    console.error("Save Error:", e);
+                }
             }
         }
 
